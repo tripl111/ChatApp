@@ -1,0 +1,14 @@
+sequenceDiagram
+    participant UI as Client UI
+    participant NET as Client network
+    participant S as Server
+
+    UI->>NET: Connect(host, port)
+    NET->>S: TCP connect
+    S->>NET: HELLO 1
+    NET->>S: AUTH username password
+    S->>NET: OK AUTH
+    UI->>NET: Join(room)
+    NET->>S: JOIN room
+    S->>NET: OK JOIN
+
