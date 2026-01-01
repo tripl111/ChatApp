@@ -5,6 +5,7 @@
 #include <string.h>
 
 static void trim_leading_spaces(char** p) {
+    // Move pointer past any leading spaces.
     while (**p == ' ') (*p)++;
 }
 
@@ -12,6 +13,7 @@ int chat_cmd_parse_inplace(char* payload, ChatCmd* out) {
     memset(out, 0, sizeof(*out));
     out->buf = payload;
 
+    // Split off trailing free-form text (":" delimiter).
     char* text_start = strstr(payload, " :");
     if (text_start) {
         *text_start = 0;
@@ -24,6 +26,7 @@ int chat_cmd_parse_inplace(char* payload, ChatCmd* out) {
         }
     }
 
+    // Tokenize command and up to two args by inserting NULs.
     char* p = payload;
     trim_leading_spaces(&p);
     if (*p == 0) return 0;
@@ -56,6 +59,7 @@ int chat_cmd_parse_inplace(char* payload, ChatCmd* out) {
 
 void chat_cmd_free(ChatCmd* cmd) {
     if (!cmd) return;
+    // Buffer is usually allocated by chat_frame_recv_alloc.
     free(cmd->buf);
     memset(cmd, 0, sizeof(*cmd));
 }
@@ -64,6 +68,7 @@ int chat_cmd_format(char* out, uint32_t out_cap, const char* cmd, const char* ar
     if (!out || out_cap == 0 || !cmd || cmd[0] == 0) return 0;
     out[0] = 0;
 
+    // Build output based on which optional fields are present.
     int n = 0;
     if (arg1 && arg1[0]) {
         if (arg2 && arg2[0]) {

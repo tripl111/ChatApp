@@ -11,38 +11,44 @@
 #include "chat_cmd.h"
 #include "chat_frame.h"
 
-#define CHAT_PORT_DEFAULT "5555"
-#define CHAT_NAME_MAX 31
+// Simple threaded chat server for Windows.
+// Uses length-prefixed frames and text commands from shared helpers.
+
+#define CHAT_PORT_DEFAULT "5555" // Default TCP port if none provided.
+#define CHAT_NAME_MAX 31 // Max username/room length (excluding NUL).
 
 typedef struct Client Client;
 typedef struct Room Room;
 
+// Connected client tracked by server state.
 struct Client {
     SOCKET sock;
     HANDLE thread;
-    int authed;
+    int authed; // Set after successful AUTH.
     char username[CHAT_NAME_MAX + 1];
-    Client* next;
+    Client* next; // Linked list of all clients.
 };
 
+// Chat room with a fixed-size member list (simple demo structure).
 struct Room {
     char name[CHAT_NAME_MAX + 1];
-    Client* members[128];
+    Client* members[128]; // Fixed-size array of member pointers.
     int member_count;
-    Room* next;
+    Room* next; // Linked list of rooms.
 };
 
 typedef struct ServerState {
-    CRITICAL_SECTION lock;
+    CRITICAL_SECTION lock; // Protects clients/rooms.
     Client* clients;
     Room* rooms;
-    const char* password;
+    const char* password; // Plaintext shared password from args.
 } ServerState;
 
 static int starts_with(const char* s, const char* pfx) {
     return s && pfx && strncmp(s, pfx, strlen(pfx)) == 0;
 }
 
+// Find an authenticated client by username (case-insensitive).
 static Client* state_find_client_by_name(ServerState* st, const char* username) {
     for (Client* c = st->clients; c; c = c->next) {
         if (c->authed && _stricmp(c->username, username) == 0) return c;
@@ -50,6 +56,7 @@ static Client* state_find_client_by_name(ServerState* st, const char* username) 
     return NULL;
 }
 
+// Find a room by name (case-insensitive).
 static Room* state_find_room(ServerState* st, const char* name) {
     for (Room* r = st->rooms; r; r = r->next) {
         if (_stricmp(r->name, name) == 0) return r;
@@ -57,6 +64,7 @@ static Room* state_find_room(ServerState* st, const char* name) {
     return NULL;
 }
 
+// Look up or create a room; caller must hold st->lock.
 static Room* state_get_or_create_room(ServerState* st, const char* name) {
     Room* r = state_find_room(st, name);
     if (r) return r;
@@ -70,6 +78,7 @@ static Room* state_get_or_create_room(ServerState* st, const char* name) {
     return r;
 }
 
+// Check if a client is already in the room.
 static int room_has_member(Room* r, Client* c) {
     for (int i = 0; i < r->member_count; i++) {
         if (r->members[i] == c) return 1;
@@ -77,6 +86,7 @@ static int room_has_member(Room* r, Client* c) {
     return 0;
 }
 
+// Add a client if there's capacity and not already present.
 static void room_add_member(Room* r, Client* c) {
     if (!r || !c) return;
     if (room_has_member(r, c)) return;
@@ -84,6 +94,7 @@ static void room_add_member(Room* r, Client* c) {
     r->members[r->member_count++] = c;
 }
 
+// Remove a client by swapping with the last entry.
 static void room_remove_member(Room* r, Client* c) {
     if (!r || !c) return;
     for (int i = 0; i < r->member_count; i++) {
@@ -96,26 +107,31 @@ static void room_remove_member(Room* r, Client* c) {
     }
 }
 
+// Send a raw text payload as a framed message.
 static int send_text(SOCKET sock, const char* payload) {
     return chat_frame_send(sock, payload, (uint32_t)strlen(payload));
 }
 
+// Send "OK <what>" response.
 static int send_ok(SOCKET sock, const char* what) {
     char buf[256];
     if (!chat_cmd_format(buf, sizeof(buf), "OK", what, NULL, NULL)) return 0;
     return send_text(sock, buf);
 }
 
+// Send "ERR <code> :reason" response.
 static int send_err(SOCKET sock, const char* code, const char* reason) {
     char buf[512];
     if (!chat_cmd_format(buf, sizeof(buf), "ERR", code, NULL, reason)) return 0;
     return send_text(sock, buf);
 }
 
+// Broadcast payload to all members of a room.
 static void broadcast_room(ServerState* st, Room* r, const char* payload) {
     SOCKET socks[128];
     int count = 0;
 
+    // Snapshot socket list while holding lock; send without lock.
     EnterCriticalSection(&st->lock);
     for (int i = 0; i < r->member_count && count < (int)(sizeof(socks) / sizeof(socks[0])); i++) {
         if (r->members[i]) socks[count++] = r->members[i]->sock;
@@ -127,6 +143,7 @@ static void broadcast_room(ServerState* st, Room* r, const char* payload) {
     }
 }
 
+// Remove user from all rooms and notify remaining members.
 static void broadcast_user_leave(ServerState* st, Client* c) {
     char payload[256];
 
@@ -151,12 +168,14 @@ typedef struct ThreadCtx {
     Client* client;
 } ThreadCtx;
 
+// Per-client worker thread. Handles AUTH and subsequent commands.
 static DWORD WINAPI client_thread(LPVOID param) {
     ThreadCtx* ctx = (ThreadCtx*)param;
     ServerState* st = ctx->st;
     Client* c = ctx->client;
     free(ctx);
 
+    // Protocol greeting so the client can confirm server version.
     (void)send_text(c->sock, "HELLO 1");
 
     for (;;) {
@@ -171,6 +190,7 @@ static DWORD WINAPI client_thread(LPVOID param) {
             continue;
         }
 
+        // First command must be AUTH username password.
         if (!c->authed) {
             if (_stricmp(cmd.cmd, "AUTH") != 0 || !cmd.arg1 || !cmd.arg2) {
                 free(payload);
@@ -223,6 +243,7 @@ static DWORD WINAPI client_thread(LPVOID param) {
             }
 
             char ev[256];
+            // Create room if needed and add member under lock.
             EnterCriticalSection(&st->lock);
             Room* r = state_get_or_create_room(st, room_name);
             if (r) room_add_member(r, c);
@@ -249,6 +270,7 @@ static DWORD WINAPI client_thread(LPVOID param) {
             const char* room_name = cmd.arg1;
             char ev[256];
 
+            // Remove member under lock if room exists.
             EnterCriticalSection(&st->lock);
             Room* r = state_find_room(st, room_name);
             if (r) room_remove_member(r, c);
@@ -273,6 +295,7 @@ static DWORD WINAPI client_thread(LPVOID param) {
             const char* text = cmd.text;
 
             Room* r = NULL;
+            // Validate membership under lock.
             EnterCriticalSection(&st->lock);
             r = state_find_room(st, room_name);
             int allowed = (r && room_has_member(r, c));
@@ -306,6 +329,7 @@ static DWORD WINAPI client_thread(LPVOID param) {
             const char* text = cmd.text;
 
             Client* dst = NULL;
+            // Lookup recipient under lock.
             EnterCriticalSection(&st->lock);
             dst = state_find_client_by_name(st, target);
             LeaveCriticalSection(&st->lock);
@@ -329,6 +353,7 @@ static DWORD WINAPI client_thread(LPVOID param) {
         }
 
         if (_stricmp(cmd.cmd, "PING") == 0) {
+            // Keepalive response.
             free(payload);
             (void)send_text(c->sock, "PONG");
             continue;
@@ -341,6 +366,7 @@ static DWORD WINAPI client_thread(LPVOID param) {
     shutdown(c->sock, SD_BOTH);
     closesocket(c->sock);
 
+    // Remove from global client list under lock.
     EnterCriticalSection(&st->lock);
     Client** pp = &st->clients;
     while (*pp) {
@@ -372,6 +398,7 @@ int main(int argc, char** argv) {
     const char* port = CHAT_PORT_DEFAULT;
     const char* password = NULL;
 
+    // Parse command-line args.
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
             port = argv[++i];
@@ -388,12 +415,14 @@ int main(int argc, char** argv) {
         return 2;
     }
 
+    // Initialize Winsock.
     WSADATA wsa;
     if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
         printf("WSAStartup failed\n");
         return 1;
     }
 
+    // Resolve bind address for listening socket.
     struct addrinfo hints;
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_INET;
@@ -443,6 +472,7 @@ int main(int argc, char** argv) {
 
     printf("Server listening on port %s\n", port);
 
+    // Accept clients and spawn worker threads.
     for (;;) {
         SOCKET client_sock = accept(listen_sock, NULL, NULL);
         if (client_sock == INVALID_SOCKET) break;

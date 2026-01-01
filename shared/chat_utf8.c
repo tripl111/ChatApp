@@ -4,6 +4,7 @@
 
 wchar_t* chat_utf8_to_wide_alloc(const char* s) {
     if (!s) return NULL;
+    // Query required size first, then allocate and convert.
     int needed = MultiByteToWideChar(CP_UTF8, 0, s, -1, NULL, 0);
     if (needed <= 0) return NULL;
     wchar_t* out = (wchar_t*)malloc((size_t)needed * sizeof(wchar_t));
@@ -17,6 +18,7 @@ wchar_t* chat_utf8_to_wide_alloc(const char* s) {
 
 char* chat_wide_to_utf8_alloc(const wchar_t* ws) {
     if (!ws) return NULL;
+    // Query required size first, then allocate and convert.
     int needed = WideCharToMultiByte(CP_UTF8, 0, ws, -1, NULL, 0, NULL, NULL);
     if (needed <= 0) return NULL;
     char* out = (char*)malloc((size_t)needed);
@@ -27,4 +29,3 @@ char* chat_wide_to_utf8_alloc(const wchar_t* ws) {
     }
     return out;
 }
-

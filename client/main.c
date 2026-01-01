@@ -13,6 +13,9 @@
 #include "chat_frame.h"
 #include "chat_utf8.h"
 
+// Win32 GUI client. UI runs on main thread; networking runs on a worker thread.
+// Uses shared framing/command helpers for protocol messages.
+
 #define APP_TITLE L"ChatApp Client"
 
 #define IDC_HOST 101
@@ -29,6 +32,7 @@
 #define WM_APP_NET_LINE (WM_APP + 1)
 #define WM_APP_NET_STATUS (WM_APP + 2)
 
+// Application state: window handles plus network state.
 typedef struct AppState {
     HWND hwnd;
     HWND host_label;
@@ -49,12 +53,13 @@ typedef struct AppState {
 
     SOCKET sock;
     HANDLE net_thread;
-    CRITICAL_SECTION send_lock;
+    CRITICAL_SECTION send_lock; // Serialize outgoing sends.
 
-    int connected;
-    char current_room[32];
+    int connected; // Whether socket is active.
+    char current_room[32]; // Last joined room for plain messages.
 } AppState;
 
+// Snapshot of connection parameters passed to the network thread.
 typedef struct NetStart {
     HWND hwnd;
     char host[256];
@@ -68,6 +73,7 @@ static int starts_with(const char* s, const char* pfx) {
 }
 
 static void ui_append_line(AppState* st, const wchar_t* line) {
+    // Append line plus newline to the log edit control.
     if (!line) return;
     int len = GetWindowTextLengthW(st->log_edit);
     SendMessageW(st->log_edit, EM_SETSEL, (WPARAM)len, (LPARAM)len);
@@ -76,6 +82,7 @@ static void ui_append_line(AppState* st, const wchar_t* line) {
 }
 
 static void ui_set_connected(AppState* st, int connected) {
+    // Toggle UI controls based on connection state.
     st->connected = connected;
     EnableWindow(st->connect_btn, !connected);
     EnableWindow(st->join_btn, connected);
@@ -84,6 +91,7 @@ static void ui_set_connected(AppState* st, int connected) {
 }
 
 static int ui_get_text_utf8(HWND hwnd, char* out, int out_cap) {
+    // Fetch text from an edit control and convert it to UTF-8.
     if (!out || out_cap <= 0) return 0;
     out[0] = 0;
 
@@ -102,6 +110,7 @@ static int ui_get_text_utf8(HWND hwnd, char* out, int out_cap) {
 
 static int client_send_payload(AppState* st, const char* payload) {
     if (!st->connected || st->sock == INVALID_SOCKET) return 0;
+    // Serialize sends to avoid interleaving frames.
     EnterCriticalSection(&st->send_lock);
     int ok = chat_frame_send(st->sock, payload, (uint32_t)strlen(payload));
     LeaveCriticalSection(&st->send_lock);
@@ -110,15 +119,18 @@ static int client_send_payload(AppState* st, const char* payload) {
 
 static int client_send_cmd(AppState* st, const char* cmd, const char* arg1, const char* arg2, const char* text) {
     char buf[1024];
+    // Format a protocol command with optional args/text.
     if (!chat_cmd_format(buf, sizeof(buf), cmd, arg1, arg2, text)) return 0;
     return client_send_payload(st, buf);
 }
 
+// Background thread: connect, handshake, AUTH, then receive messages.
 static DWORD WINAPI net_thread_main(LPVOID param) {
     NetStart* ns = (NetStart*)param;
 
     PostMessageW(ns->hwnd, WM_APP_NET_LINE, 0, (LPARAM)_strdup("Connecting..."));
 
+    // Resolve host/port and open a TCP connection.
     struct addrinfo hints;
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_INET;
@@ -155,6 +167,7 @@ static DWORD WINAPI net_thread_main(LPVOID param) {
 
     PostMessageW(ns->hwnd, WM_APP_NET_STATUS, 1, (LPARAM)sock);
 
+    // Expect initial HELLO from server.
     uint8_t* payload = NULL;
     uint32_t payload_len = 0;
     if (!chat_frame_recv_alloc(sock, &payload, &payload_len, CHAT_MAX_FRAME)) {
@@ -177,6 +190,7 @@ static DWORD WINAPI net_thread_main(LPVOID param) {
     }
     free(payload);
 
+    // Send AUTH with username/password.
     char auth[256];
     snprintf(auth, sizeof(auth), "AUTH %s %s", ns->user, ns->pass);
     if (!chat_frame_send(sock, auth, (uint32_t)strlen(auth))) {
@@ -188,10 +202,12 @@ static DWORD WINAPI net_thread_main(LPVOID param) {
         return 0;
     }
 
+    // Read frames and forward text lines to the UI thread.
     for (;;) {
         uint8_t* p = NULL;
         uint32_t n = 0;
         if (!chat_frame_recv_alloc(sock, &p, &n, CHAT_MAX_FRAME)) break;
+        // UI thread takes ownership of buffer and frees it.
         PostMessageW(ns->hwnd, WM_APP_NET_LINE, 0, (LPARAM)p);
     }
 
@@ -203,6 +219,7 @@ static DWORD WINAPI net_thread_main(LPVOID param) {
 }
 
 static void layout(AppState* st) {
+    // Simple absolute layout for controls.
     RECT rc;
     GetClientRect(st->hwnd, &rc);
 
@@ -262,6 +279,7 @@ static void layout(AppState* st) {
 }
 
 static void send_input(AppState* st) {
+    // Local slash commands; otherwise send MSG to current room.
     char input[512];
     if (!ui_get_text_utf8(st->input_edit, input, (int)sizeof(input))) return;
     if (input[0] == 0) return;
@@ -301,11 +319,13 @@ static void send_input(AppState* st) {
     (void)client_send_cmd(st, "MSG", st->current_room, NULL, input);
 }
 
+// Main window procedure for UI and custom network messages.
 static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
     AppState* st = (AppState*)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
 
     switch (msg) {
     case WM_CREATE: {
+        // Create controls and initialize state.
         st = (AppState*)((CREATESTRUCTW*)lparam)->lpCreateParams;
         st->hwnd = hwnd;
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)st);
@@ -417,10 +437,12 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpara
     case WM_APP_NET_STATUS: {
         if (!st) break;
         if (wparam == 1) {
+            // Connected: lparam is SOCKET from network thread.
             st->sock = (SOCKET)lparam;
             ui_set_connected(st, 1);
             ui_append_line(st, L"Connected. Waiting for AUTH response...");
         } else {
+            // Disconnected: lparam may be a UTF-8 status message.
             char* msg8 = (char*)lparam;
             if (msg8) {
                 wchar_t* w = chat_utf8_to_wide_alloc(msg8);
@@ -437,6 +459,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpara
     }
     case WM_APP_NET_LINE: {
         if (!st) break;
+        // line8 was allocated in network thread; free after use.
         char* line8 = (char*)lparam;
         if (!line8) return 0;
 
@@ -472,6 +495,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, PWSTR cmdLine, int show) {
     (void)hPrev;
     (void)cmdLine;
 
+    // Initialize common controls and Winsock.
     INITCOMMONCONTROLSEX icc;
     memset(&icc, 0, sizeof(icc));
     icc.dwSize = sizeof(icc);
@@ -504,6 +528,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, PWSTR cmdLine, int show) {
     ShowWindow(hwnd, show);
     UpdateWindow(hwnd);
 
+    // Standard message loop.
     MSG msg;
     while (GetMessageW(&msg, NULL, 0, 0) > 0) {
         TranslateMessage(&msg);
